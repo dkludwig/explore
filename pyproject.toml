@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "explore"
+version = "0.1.0"
+description = "Data exploration applications"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "holoviews",
+    "matplotlib",
+    "numpy",
+    "panel",
+    "pillow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.0.250",
+]
+
+[project.scripts]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py313"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
