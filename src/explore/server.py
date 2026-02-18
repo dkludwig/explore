@@ -14,6 +14,9 @@ Features:
 """
 
 import json
+import subprocess
+import sys
+import threading
 
 import holoviews as hv
 import numpy as np
@@ -23,10 +26,14 @@ import param
 from .dataset import Scan
 from .transforms import REGISTRY as TRANSFORM_REGISTRY, apply_transform, apply_to_scan
 from .launcher import notify
+from .constants import ASPECT_RATIO
 
 
 hv.extension("bokeh")
 pn.extension(sizing_mode="stretch_width")
+
+# Registry of active ScanBrowser instances by serial, for the picks REST endpoint.
+_browsers: dict[str, "ScanBrowser"] = {}
 
 
 class ScanBrowser(param.Parameterized):
@@ -53,16 +60,16 @@ class ScanBrowser(param.Parameterized):
 
         if serial:
             self._scan = Scan.load(serial)
-            thumb_dir = self._scan.dir / "thumbnails"
-            if not thumb_dir.exists() or not any(thumb_dir.glob("*.png")):
-                self._scan.render()
             # Build sorted key list: [(exp, rep), ...]
             self._dataset_keys = sorted(
                 [(ds.experiment, ds.repeat) for ds in self._scan.datasets],
                 key=lambda k: (k[0], k[1]),
             )
             self._grid = self._build_grid()
+            # Kick off background thumbnail rendering
+            self._start_background_render()
             self.param.watch(self._update_grid_highlight, "selected_index")
+            _browsers[serial] = self
 
     def _current_dataset(self):
         if not self._dataset_keys:
@@ -393,29 +400,41 @@ class ScanBrowser(param.Parameterized):
     _BTN_SELECTED = ":host .bk-btn { background: #2196F3; color: white; font-size: 16px; font-weight: bold }"
     _BTN_DEFAULT = ":host .bk-btn { background: #222; color: white; font-size: 16px }"
 
+    _THUMB_H = 150
+
     def _build_grid(self):
-        """Build the thumbnail grid once. Store references for fast updates."""
+        """Build the thumbnail grid with buttons above their PNGs."""
         thumb_dir = self._scan.dir / "thumbnails"
+        img_w = int(self._THUMB_H * ASPECT_RATIO)
+        col_w = img_w + 10
+        col_h = self._THUMB_H + 45
 
         thumbs = []
         for i, (exp, rep) in enumerate(self._dataset_keys):
             key = f"{exp}_{rep}"
             png_path = thumb_dir / f"{key}.png"
-            if not png_path.exists():
-                self._thumb_panes.append(None)
-                self._thumb_btns.append(None)
-                continue
 
             is_selected = i == self.selected_index
-            img = pn.pane.PNG(
-                str(png_path),
-                width=150,
-                height=150,
-                styles={"border": "3px solid #2196F3" if is_selected else "1px solid #ddd"},
-            )
+            if png_path.exists():
+                img = pn.pane.PNG(
+                    str(png_path),
+                    width=img_w,
+                    height=self._THUMB_H,
+                    styles={"border": "3px solid #2196F3" if is_selected else "1px solid #ddd"},
+                )
+            else:
+                img = pn.pane.PNG(
+                    None,
+                    width=img_w,
+                    height=self._THUMB_H,
+                    styles={
+                        "border": "3px solid #2196F3" if is_selected else "1px solid #ddd",
+                        "background": "#333",
+                    },
+                )
             btn = pn.widgets.Button(
                 name=key,
-                width=155,
+                width=img_w,
                 height=35,
                 button_type="default",
                 stylesheets=[self._BTN_SELECTED if is_selected else self._BTN_DEFAULT],
@@ -425,13 +444,49 @@ class ScanBrowser(param.Parameterized):
             )
             self._thumb_panes.append(img)
             self._thumb_btns.append(btn)
-            thumbs.append(pn.Column(btn, img, width=160, height=195, margin=2))
+            thumbs.append(pn.Column(btn, img, width=col_w, height=col_h, margin=2))
 
         return pn.Column(
             pn.pane.Markdown(f"## Scan: {self.serial} &nbsp; ({len(self._dataset_keys)} datasets)"),
             pn.FlexBox(*thumbs),
             sizing_mode="stretch_width",
         )
+
+    def _start_background_render(self):
+        """Render thumbnails in a subprocess, then update all panes at once."""
+        thumb_dir = self._scan.dir / "thumbnails"
+
+        # Collect indices that need rendering
+        pending = {}
+        for i, (exp, rep) in enumerate(self._dataset_keys):
+            key = f"{exp}_{rep}"
+            if not (thumb_dir / f"{key}.png").exists():
+                pending[key] = i
+
+        if not pending:
+            return
+
+        # Launch Scan.render() in a subprocess (avoids GIL, gets its own matplotlib)
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             f"from explore.dataset import Scan; Scan.load('{self.serial}').render()"],
+        )
+
+        def wait_and_rebuild():
+            """Wait for subprocess to finish, then rebuild the grid in one shot."""
+            proc.wait()
+
+            def rebuild():
+                self._thumb_panes.clear()
+                self._thumb_btns.clear()
+                new_grid = self._build_grid()
+                # Swap the FlexBox content inside the existing grid layout
+                self._grid[1] = new_grid[1]
+
+            pn.state.execute(rebuild)
+
+        t = threading.Thread(target=wait_and_rebuild, daemon=True)
+        t.start()
 
     def _update_grid_highlight(self, event):
         """Update only the two affected thumbnails' styles. O(1) not O(n)."""
@@ -505,6 +560,24 @@ def app():
     return template
 
 
+def _make_extra_patterns():
+    """Create Tornado URL patterns for REST endpoints."""
+    import tornado.web
+
+    class PicksHandler(tornado.web.RequestHandler):
+        def get(self):
+            serial = self.get_argument("serial", "")
+            browser = _browsers.get(serial)
+            if browser is None:
+                self.set_status(404)
+                self.write({"error": f"No active browser for serial={serial}"})
+                return
+            self.set_header("Content-Type", "application/json")
+            self.write(json.dumps(browser.picked_points))
+
+    return [("/picks", PicksHandler)]
+
+
 def serve(port: int = 5006, show: bool = False) -> None:
     """Start the Panel server (blocking)."""
     pn.serve(
@@ -512,6 +585,7 @@ def serve(port: int = 5006, show: bool = False) -> None:
         port=port,
         allow_websocket_origin=[f"localhost:{port}"],
         show=show,
+        extra_patterns=_make_extra_patterns(),
     )
 
 

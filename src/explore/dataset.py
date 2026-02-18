@@ -8,10 +8,11 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 from PIL import Image
 
-from .constants import DATA_DIR
+from .constants import DATA_DIR, ASPECT_RATIO
 
 
 def make_serial() -> str:
@@ -33,7 +34,10 @@ def _centers_to_edges(centers: np.ndarray) -> np.ndarray:
 def _render_2d(ax: plt.Axes, data: np.ndarray, x_ax: "Axes", y_ax: "Axes") -> None:
     x_edges = _centers_to_edges(x_ax.values)
     y_edges = _centers_to_edges(y_ax.values)
-    ax.pcolorfast(x_edges, y_edges, data)
+    im = ax.pcolorfast(x_edges, y_edges, data)
+    cbar = ax.figure.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
+    cbar.locator = mticker.MaxNLocator(5)
+    cbar.update_ticks()
     ax.set_xlabel(x_ax.name, fontsize=16)
     ax.set_ylabel(y_ax.name, fontsize=16)
 
@@ -225,20 +229,18 @@ class Scan:
 
     def render(
         self,
-        figsize: tuple[float, float] = (4, 4),
+        figsize: tuple[float, float] = (4 * ASPECT_RATIO, 4),
         dpi: int = 100,
         encode_workers: int = 4,
     ) -> dict[tuple[str, int], bytes]:
         """Render all datasets to PNG thumbnails in {dir}/thumbnails/.
 
-        Reuses a single figure/axes pair and encodes PNGs in parallel.
+        Creates a fresh figure per dataset (avoids gridspec/colorbar corruption)
+        and encodes PNGs in parallel.
         Returns a dict mapping (experiment, repeat) → PNG bytes.
         """
         thumb_dir = self.dir / "thumbnails"
         thumb_dir.mkdir(parents=True, exist_ok=True)
-
-        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-        fig.subplots_adjust(left=0.15, right=0.95, top=0.88, bottom=0.15)
 
         t0 = time.perf_counter()
 
@@ -247,7 +249,8 @@ class Scan:
         frames: list[np.ndarray] = []
 
         for dataset in self.datasets:
-            ax.clear()
+            fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+            fig.subplots_adjust(left=0.15, right=0.85, top=0.88, bottom=0.15)
 
             if dataset.data.ndim >= 2:
                 data_2d, x_ax, y_ax = dataset.slice_2d()
@@ -265,8 +268,7 @@ class Scan:
             fig.canvas.draw()
             frames.append(np.array(fig.canvas.buffer_rgba()))
             keys.append((dataset.experiment, dataset.repeat))
-
-        plt.close(fig)
+            plt.close(fig)
 
         # Phase 2: encode PNGs in parallel
         with ThreadPoolExecutor(max_workers=encode_workers) as pool:
