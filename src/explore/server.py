@@ -35,6 +35,62 @@ pn.extension(sizing_mode="stretch_width")
 # Registry of active ScanBrowser instances by serial, for the picks REST endpoint.
 _browsers: dict[str, "ScanBrowser"] = {}
 
+# --- Long-lived render worker (one subprocess for the lifetime of the server) ---
+
+_RENDER_WORKER_SCRIPT = (
+    "import sys\n"
+    "_proto = sys.stdout\n"
+    "sys.stdout = sys.stderr\n"
+    "from explore.dataset import Scan\n"
+    "for line in sys.stdin:\n"
+    "    serial = line.strip()\n"
+    "    if not serial: continue\n"
+    "    try:\n"
+    "        Scan.load(serial).render()\n"
+    '        _proto.write("done " + serial + chr(10))\n'
+    "        _proto.flush()\n"
+    "    except Exception as e:\n"
+    '        _proto.write("error " + serial + " " + str(e) + chr(10))\n'
+    "        _proto.flush()\n"
+)
+
+_render_worker: subprocess.Popen | None = None
+_render_callbacks: dict[str, callable] = {}
+_render_lock = threading.Lock()
+
+
+def _start_render_worker():
+    """Launch the long-lived render subprocess and its stdout reader thread."""
+    global _render_worker
+    _render_worker = subprocess.Popen(
+        [sys.executable, "-c", _RENDER_WORKER_SCRIPT],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+
+    def reader():
+        for line in _render_worker.stdout:
+            parts = line.strip().split(" ", 1)
+            if len(parts) >= 2 and parts[0] == "done":
+                serial = parts[1]
+                with _render_lock:
+                    cb = _render_callbacks.pop(serial, None)
+                if cb:
+                    pn.state.execute(cb)
+
+    threading.Thread(target=reader, daemon=True).start()
+
+
+def _submit_render(serial: str, callback: callable):
+    """Send a serial to the render worker; callback fires on the main thread when done."""
+    if _render_worker is None or _render_worker.poll() is not None:
+        _start_render_worker()
+    with _render_lock:
+        _render_callbacks[serial] = callback
+    _render_worker.stdin.write(serial + "\n")
+    _render_worker.stdin.flush()
+
 
 class ScanBrowser(param.Parameterized):
     """Per-session state for one browser tab viewing one scan."""
@@ -382,7 +438,8 @@ class ScanBrowser(param.Parameterized):
             axis = axis_select.value
             new_scan = apply_to_scan(self._scan, op, axis)
             new_scan.save()
-            new_scan.render()
+            # Render via shared worker, open tab immediately (grid populates when done)
+            _submit_render(new_scan.serial, lambda: None)
             notify(new_scan.serial)
 
         preview_btn.on_click(on_preview)
@@ -453,40 +510,24 @@ class ScanBrowser(param.Parameterized):
         )
 
     def _start_background_render(self):
-        """Render thumbnails in a subprocess, then update all panes at once."""
+        """Submit rendering to the shared worker subprocess."""
         thumb_dir = self._scan.dir / "thumbnails"
 
-        # Collect indices that need rendering
-        pending = {}
-        for i, (exp, rep) in enumerate(self._dataset_keys):
-            key = f"{exp}_{rep}"
-            if not (thumb_dir / f"{key}.png").exists():
-                pending[key] = i
-
-        if not pending:
+        # Check if any thumbnails are missing
+        needs_render = any(
+            not (thumb_dir / f"{exp}_{rep}.png").exists()
+            for exp, rep in self._dataset_keys
+        )
+        if not needs_render:
             return
 
-        # Launch Scan.render() in a subprocess (avoids GIL, gets its own matplotlib)
-        proc = subprocess.Popen(
-            [sys.executable, "-c",
-             f"from explore.dataset import Scan; Scan.load('{self.serial}').render()"],
-        )
+        def on_done():
+            self._thumb_panes.clear()
+            self._thumb_btns.clear()
+            new_grid = self._build_grid()
+            self._grid[1] = new_grid[1]
 
-        def wait_and_rebuild():
-            """Wait for subprocess to finish, then rebuild the grid in one shot."""
-            proc.wait()
-
-            def rebuild():
-                self._thumb_panes.clear()
-                self._thumb_btns.clear()
-                new_grid = self._build_grid()
-                # Swap the FlexBox content inside the existing grid layout
-                self._grid[1] = new_grid[1]
-
-            pn.state.execute(rebuild)
-
-        t = threading.Thread(target=wait_and_rebuild, daemon=True)
-        t.start()
+        _submit_render(self.serial, on_done)
 
     def _update_grid_highlight(self, event):
         """Update only the two affected thumbnails' styles. O(1) not O(n)."""
@@ -580,6 +621,8 @@ def _make_extra_patterns():
 
 def serve(port: int = 5006, show: bool = False) -> None:
     """Start the Panel server (blocking)."""
+    # Start the render worker early so it pays the import cost while the server boots
+    _start_render_worker()
     pn.serve(
         {"explore": app},
         port=port,
