@@ -26,7 +26,7 @@ import param
 from .dataset import Scan
 from .transforms import REGISTRY as TRANSFORM_REGISTRY, apply_transform, apply_to_scan
 from .launcher import notify
-from .constants import ASPECT_RATIO
+from .constants import ASPECT_RATIO, DATA_DIR
 
 
 hv.extension("bokeh")
@@ -109,22 +109,15 @@ class ScanBrowser(param.Parameterized):
         self._tap_stream = hv.streams.Tap(transient=True)
         self._tap_stream.param.watch(self._on_tap, ["x", "y"])
         self._points_pipe = hv.streams.Pipe(data=[])
-
-        self._thumb_panes: list[pn.pane.PNG | None] = []
-        self._thumb_btns: list[pn.widgets.Button | None] = []
-        self._grid = None
+        self._sidebar_initialized = False
+        self._grid_pane = None  # set by app() after grid HTML pane is created
 
         if serial:
             self._scan = Scan.load(serial)
-            # Build sorted key list: [(exp, rep), ...]
             self._dataset_keys = sorted(
                 [(ds.experiment, ds.repeat) for ds in self._scan.datasets],
                 key=lambda k: (k[0], k[1]),
             )
-            self._grid = self._build_grid()
-            # Kick off background thumbnail rendering
-            self._start_background_render()
-            self.param.watch(self._update_grid_highlight, "selected_index")
             _browsers[serial] = self
 
     def _current_dataset(self):
@@ -218,6 +211,8 @@ class ScanBrowser(param.Parameterized):
 
     @param.depends("selected_index", "_transform_changed")
     def sidebar_plot(self):
+        if not self._sidebar_initialized:
+            return pn.pane.Markdown("*Loading...*", width=680, height=200)
         dataset = self._current_dataset()
         if dataset is None:
             return pn.pane.Markdown("*No dataset selected*")
@@ -454,66 +449,49 @@ class ScanBrowser(param.Parameterized):
 
     # --- Main: thumbnail grid ---
 
-    _BTN_SELECTED = ":host .bk-btn { background: #2196F3; color: white; font-size: 16px; font-weight: bold }"
-    _BTN_DEFAULT = ":host .bk-btn { background: #222; color: white; font-size: 16px }"
-
     _THUMB_H = 150
 
-    def _build_grid(self):
-        """Build the thumbnail grid with buttons above their PNGs."""
+    def _build_grid_html(self) -> str:
+        """Generate raw HTML for the thumbnail grid. One string, zero Bokeh models."""
         thumb_dir = self._scan.dir / "thumbnails"
         img_w = int(self._THUMB_H * ASPECT_RATIO)
-        col_w = img_w + 10
-        col_h = self._THUMB_H + 45
 
-        thumbs = []
+        cells = []
         for i, (exp, rep) in enumerate(self._dataset_keys):
             key = f"{exp}_{rep}"
             png_path = thumb_dir / f"{key}.png"
-
-            is_selected = i == self.selected_index
             if png_path.exists():
-                img = pn.pane.PNG(
-                    str(png_path),
-                    width=img_w,
-                    height=self._THUMB_H,
-                    styles={"border": "3px solid #2196F3" if is_selected else "1px solid #ddd"},
+                img_tag = (
+                    f'<img src="/thumbnails/{self.serial}/thumbnails/{key}.png"'
+                    f' width="{img_w}" height="{self._THUMB_H}"'
+                    f' style="display:block;" />'
                 )
             else:
-                img = pn.pane.PNG(
-                    None,
-                    width=img_w,
-                    height=self._THUMB_H,
-                    styles={
-                        "border": "3px solid #2196F3" if is_selected else "1px solid #ddd",
-                        "background": "#333",
-                    },
+                img_tag = (
+                    f'<div style="width:{img_w}px;height:{self._THUMB_H}px;'
+                    f'background:#333;"></div>'
                 )
-            btn = pn.widgets.Button(
-                name=key,
-                width=img_w,
-                height=35,
-                button_type="default",
-                stylesheets=[self._BTN_SELECTED if is_selected else self._BTN_DEFAULT],
-            )
-            btn.on_click(
-                lambda e, idx=i: setattr(self, "selected_index", idx)
-            )
-            self._thumb_panes.append(img)
-            self._thumb_btns.append(btn)
-            thumbs.append(pn.Column(btn, img, width=col_w, height=col_h, margin=2))
 
-        return pn.Column(
-            pn.pane.Markdown(f"## Scan: {self.serial} &nbsp; ({len(self._dataset_keys)} datasets)"),
-            pn.FlexBox(*thumbs),
-            sizing_mode="stretch_width",
+            cells.append(
+                f'<div class="thumb" data-idx="{i}" onclick="window._selectThumb({i})"'
+                f' style="cursor:pointer;display:inline-block;'
+                f'margin:2px;text-align:center;border:1px solid #555;">'
+                f'<div style="background:#222;color:white;padding:4px 2px;'
+                f'font-size:14px;font-weight:bold;width:{img_w}px;">{key}</div>'
+                f'{img_tag}'
+                f'</div>'
+            )
+
+        return (
+            f'<div style="display:flex;flex-wrap:wrap;">'
+            f'{"".join(cells)}'
+            f'</div>'
         )
 
     def _start_background_render(self):
-        """Submit rendering to the shared worker subprocess."""
+        """Render thumbnails in a subprocess, then update grid HTML at once."""
         thumb_dir = self._scan.dir / "thumbnails"
 
-        # Check if any thumbnails are missing
         needs_render = any(
             not (thumb_dir / f"{exp}_{rep}.png").exists()
             for exp, rep in self._dataset_keys
@@ -521,55 +499,40 @@ class ScanBrowser(param.Parameterized):
         if not needs_render:
             return
 
-        def on_done():
-            self._thumb_panes.clear()
-            self._thumb_btns.clear()
-            new_grid = self._build_grid()
-            self._grid[1] = new_grid[1]
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             f"from explore.dataset import Scan; Scan.load('{self.serial}').render()"],
+        )
 
-        _submit_render(self.serial, on_done)
+        def wait_and_rebuild():
+            proc.wait()
+            pn.state.execute(lambda: setattr(self._grid_pane, 'object', self._build_grid_html()))
 
-    def _update_grid_highlight(self, event):
-        """Update only the two affected thumbnails' styles. O(1) not O(n)."""
-        for idx, is_sel in [(event.old, False), (event.new, True)]:
-            if 0 <= idx < len(self._thumb_panes) and self._thumb_panes[idx]:
-                self._thumb_panes[idx].styles = {
-                    "border": "3px solid #2196F3" if is_sel else "1px solid #ddd"
-                }
-                self._thumb_btns[idx].stylesheets = [
-                    self._BTN_SELECTED if is_sel else self._BTN_DEFAULT
-                ]
-
-    def grid_view(self):
-        """Return the pre-built grid. No @param.depends — never rebuilds."""
-        if not self._grid:
-            return pn.pane.Markdown(
-                "# Waiting for scan...\n\n"
-                "The experiment process will open a tab automatically."
-            )
-        return self._grid
+        t = threading.Thread(target=wait_and_rebuild, daemon=True)
+        t.start()
 
 
-class KeyNav(pn.reactive.ReactiveHTML):
-    """Invisible element that captures global arrow key events."""
+class GridNav(pn.reactive.ReactiveHTML):
+    """Invisible element: bridges grid onclick and Tab/Shift-Tab → Python selected_index."""
 
-    index = param.Integer(default=0)
+    selected_index = param.Integer(default=0)
     max_index = param.Integer(default=0)
 
-    _template = """<div id="keynav" style="width:0;height:0;overflow:hidden;"></div>"""
+    _template = """<div id="nav" style="width:0;height:0;overflow:hidden;"></div>"""
 
     _scripts = {
         "render": """
+        window._selectThumb = (idx) => { data.selected_index = idx; };
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Tab' && !e.shiftKey) {
                 e.preventDefault();
-                data.index = Math.min(data.index + 1, data.max_index);
+                data.selected_index = Math.min(data.selected_index + 1, data.max_index);
             } else if (e.key === 'Tab' && e.shiftKey) {
                 e.preventDefault();
-                data.index = Math.max(data.index - 1, 0);
+                data.selected_index = Math.max(data.selected_index - 1, 0);
             }
         });
-        """
+        """,
     }
 
 
@@ -581,20 +544,35 @@ def app():
 
     browser = ScanBrowser(serial=serial)
 
-    # Wire keyboard nav to browser
-    keynav = KeyNav(max_index=max(len(browser._dataset_keys) - 1, 0))
-    keynav.param.watch(
-        lambda e: setattr(browser, "selected_index", e.new), "index"
+    # Grid: plain HTML pane (handles any size, no Bokeh model overhead)
+    grid_pane = pn.pane.HTML(
+        browser._build_grid_html() if browser._scan else "",
+        sizing_mode="stretch_width",
     )
-    browser.param.watch(
-        lambda e: setattr(keynav, "index", e.new), "selected_index"
+    browser._grid_pane = grid_pane
+
+    # Nav: tiny invisible ReactiveHTML bridging grid onclick → Python
+    nav = GridNav(max_index=max(len(browser._dataset_keys) - 1, 0))
+    nav.param.watch(
+        lambda e: setattr(browser, "selected_index", e.new), "selected_index"
     )
+
+    # Kick off background rendering now that grid pane is wired up
+    if browser._scan:
+        browser._start_background_render()
+
+    # Defer sidebar: render placeholder initially, full HoloViews after page loads
+    def _init_sidebar():
+        browser._sidebar_initialized = True
+        browser.param.trigger("_transform_changed")  # forces sidebar_plot re-eval
+
+    pn.state.onload(_init_sidebar)
 
     template = pn.template.FastListTemplate(
         title=f"Scan: {serial}" if serial else "Explore",
         sidebar_width=750,
         sidebar=[browser.sidebar_plot, browser.sidebar_controls, browser.sidebar_transforms],
-        main=[keynav, browser.grid_view],
+        main=[nav, grid_pane],
         theme="dark",
     )
 
@@ -616,7 +594,10 @@ def _make_extra_patterns():
             self.set_header("Content-Type", "application/json")
             self.write(json.dumps(browser.picked_points))
 
-    return [("/picks", PicksHandler)]
+    return [
+        ("/picks", PicksHandler),
+        (r"/thumbnails/(.*)", tornado.web.StaticFileHandler, {"path": str(DATA_DIR)}),
+    ]
 
 
 def serve(port: int = 5006, show: bool = False) -> None:
