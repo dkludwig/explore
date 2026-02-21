@@ -219,8 +219,8 @@ class ScanBrowser(param.Parameterized):
 
         # Apply active transform if set
         if self._active_transform is not None:
-            op, over_ax = self._active_transform
-            dataset = apply_transform(dataset, op, over_ax)
+            op, kwargs = self._active_transform
+            dataset = apply_transform(dataset, op, **kwargs)
 
         exp, rep = dataset.experiment, dataset.repeat
 
@@ -403,18 +403,68 @@ class ScanBrowser(param.Parameterized):
             return pn.pane.Markdown("")
 
         axis_names = [a.name for a in dataset.axes]
+
         op_select = pn.widgets.Select(
             name="Operation",
             options=["none"] + list(TRANSFORM_REGISTRY),
             value="none" if self._active_transform is None else self._active_transform[0],
             width=200,
         )
-        axis_select = pn.widgets.Select(
-            name="Over axis",
-            options=axis_names,
-            value=self._active_transform[1] if self._active_transform else axis_names[0],
-            width=200,
-        )
+
+        # Container for dynamically generated param widgets
+        param_row = pn.Row()
+        # Map from param name → widget, for collecting values
+        param_widgets: dict[str, pn.widgets.Widget] = {}
+
+        def _build_param_widgets(op_name):
+            param_row.clear()
+            param_widgets.clear()
+            if op_name == "none":
+                return
+            spec = TRANSFORM_REGISTRY[op_name]
+            prev_kwargs = self._active_transform[1] if self._active_transform and self._active_transform[0] == op_name else {}
+            axis_widget = None
+            for p in spec.params:
+                if p["type"] == "axis":
+                    w = pn.widgets.Select(
+                        name=p["name"], options=axis_names,
+                        value=prev_kwargs.get(p["name"], axis_names[0]),
+                        width=150,
+                    )
+                    axis_widget = w
+                elif p["type"] == "axis_value":
+                    # Populate from the axis currently selected in the preceding axis widget
+                    ax_name = axis_widget.value if axis_widget else axis_names[0]
+                    ax_vals = next(a for a in dataset.axes if a.name == ax_name).values
+                    options = [round(float(v), 6) for v in ax_vals]
+                    default = prev_kwargs.get(p["name"], options[0])
+                    if default not in options:
+                        default = options[0]
+                    w = pn.widgets.Select(
+                        name=p["name"], options=options, value=default, width=150,
+                    )
+                    # Re-populate when the axis widget changes
+                    if axis_widget is not None:
+                        _aw, _vw = axis_widget, w  # capture for closure
+                        def _update_axis_values(event, vw=_vw):
+                            new_ax = next(a for a in dataset.axes if a.name == event.new)
+                            vw.options = [round(float(v), 6) for v in new_ax.values]
+                            vw.value = vw.options[0]
+                        _aw.param.watch(_update_axis_values, "value")
+                elif p["type"] == "float":
+                    w = pn.widgets.FloatInput(
+                        name=p["name"], value=prev_kwargs.get(p["name"], 0.0), width=150,
+                    )
+                else:
+                    continue
+                param_widgets[p["name"]] = w
+                param_row.append(w)
+
+        _build_param_widgets(op_select.value)
+        op_select.param.watch(lambda e: _build_param_widgets(e.new), "value")
+
+        def _collect_kwargs():
+            return {name: w.value for name, w in param_widgets.items()}
 
         preview_btn = pn.widgets.Button(name="Preview", button_type="primary", width=120)
         apply_btn = pn.widgets.Button(name="Apply", button_type="success", width=120)
@@ -423,15 +473,15 @@ class ScanBrowser(param.Parameterized):
             if op_select.value == "none":
                 self._active_transform = None
             else:
-                self._active_transform = (op_select.value, axis_select.value)
+                self._active_transform = (op_select.value, _collect_kwargs())
             self.param.trigger("_transform_changed")
 
         def on_apply(event):
             op = op_select.value
             if op == "none":
                 return
-            axis = axis_select.value
-            new_scan = apply_to_scan(self._scan, op, axis)
+            kwargs = _collect_kwargs()
+            new_scan = apply_to_scan(self._scan, op, **kwargs)
             new_scan.save()
             # Render via shared worker, open tab immediately (grid populates when done)
             _submit_render(new_scan.serial, lambda: None)
@@ -443,7 +493,8 @@ class ScanBrowser(param.Parameterized):
         return pn.Column(
             pn.layout.Divider(),
             pn.pane.Markdown("**Transform**"),
-            pn.Row(op_select, axis_select),
+            pn.Row(op_select),
+            param_row,
             pn.Row(preview_btn, apply_btn),
         )
 
