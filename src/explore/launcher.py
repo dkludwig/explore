@@ -33,9 +33,14 @@ def _open_background(url: str) -> None:
         webbrowser.open(url)
 
 
-def notify(serial: str, port: int = DEFAULT_PORT, focus: bool = False) -> str:
+def notify(serial: str, port: int = DEFAULT_PORT, focus: bool = False,
+           x: str | None = None, y: str | None = None) -> str:
     """Open a new browser tab for the given scan. Prefer Client.plot()."""
     url = f"http://localhost:{port}/explore?serial={serial}"
+    if x:
+        url += f"&x={x}"
+    if y:
+        url += f"&y={y}"
     if focus:
         webbrowser.open(url)
     else:
@@ -50,9 +55,14 @@ class Client:
         self.serial = serial
         self.port = port
 
-    def plot(self, focus: bool = False) -> str:
-        """Open a browser tab for this scan. Returns the URL."""
-        return notify(self.serial, port=self.port, focus=focus)
+    def plot(self, focus: bool = False, x: str | None = None, y: str | None = None) -> str:
+        """Open a browser tab for this scan. Returns the URL.
+
+        Args:
+            x: Axis name for the X plot axis.
+            y: Axis name for the Y plot axis.
+        """
+        return notify(self.serial, port=self.port, focus=focus, x=x, y=y)
 
     def get_picks(self) -> list[dict]:
         """Query the server for picked points on this scan."""

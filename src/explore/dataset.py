@@ -73,7 +73,7 @@ class Dataset:
     repeat: int
     data: np.ndarray
     axes: list[Axes]
-    _axis_plot_order: list[str] | None = dataclasses.field(
+    _plot_selections: dict[str, str] | None = dataclasses.field(
         default=None, repr=False
     )
 
@@ -86,26 +86,39 @@ class Dataset:
             )
 
     @property
-    def axis_plot_order(self) -> list[str]:
-        """[x_name, y_name, slider0_name, ...] — defaults to descending axis length."""
-        if self._axis_plot_order is not None:
-            return self._axis_plot_order
+    def plot_selections(self) -> dict[str, str]:
+        """{"x": axis_name, "y": axis_name} — defaults to two longest axes."""
+        if self._plot_selections is not None:
+            return self._plot_selections
         sorted_axes = sorted(
             self.axes, key=lambda a: len(a.values), reverse=True
         )
-        return [a.name for a in sorted_axes]
+        sel = {"x": sorted_axes[0].name}
+        if len(sorted_axes) > 1:
+            sel["y"] = sorted_axes[1].name
+        return sel
 
-    @axis_plot_order.setter
-    def axis_plot_order(self, order: list[str]) -> None:
-        self._axis_plot_order = order
+    @plot_selections.setter
+    def plot_selections(self, sel: dict[str, str]) -> None:
+        self._plot_selections = sel
+
+    @property
+    def plot_order(self) -> list[str]:
+        """[x_name, y_name, slider0_name, ...] derived from plot_selections."""
+        sel = self.plot_selections
+        chosen = [sel["x"]]
+        if "y" in sel:
+            chosen.append(sel["y"])
+        remaining = [a.name for a in self.axes if a.name not in chosen]
+        return chosen + remaining
 
     def slice_2d(self) -> tuple[np.ndarray, "Axes", "Axes"]:
-        """Slice nD data to 2D using axis_plot_order.
+        """Slice nD data to 2D using plot_selections.
 
         Returns (data_2d, x_axis, y_axis) where data_2d has shape (len(y), len(x)).
         """
-        order = self.axis_plot_order
-        x_name, y_name = order[0], order[1]
+        sel = self.plot_selections
+        x_name, y_name = sel["x"], sel["y"]
 
         # Build index: full slice for plot axes, middle for sliders
         idx = []

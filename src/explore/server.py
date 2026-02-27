@@ -136,19 +136,43 @@ class ScanBrowser(param.Parameterized):
         exp, rep = self._dataset_keys[self.selected_index]
         return f"{exp}_{rep}"
 
+    def _set_plot_selections(self, sel: dict[str, str]):
+        """Set plot_selections on all datasets in the scan."""
+        if self._scan is None:
+            return
+        for ds in self._scan.datasets:
+            # Merge: only set keys that exist as valid axis names
+            valid = {a.name for a in ds.axes}
+            new_sel = dict(ds.plot_selections)
+            for k, v in sel.items():
+                if v in valid:
+                    new_sel[k] = v
+            ds.plot_selections = new_sel
+        self.param.trigger("_transform_changed")
+
     # --- Point picking ---
+
+    def _viewed_dataset(self):
+        """Get the dataset as the user sees it (with active transform applied)."""
+        dataset = self._current_dataset()
+        if dataset is None:
+            return None
+        if self._active_transform is not None:
+            op, kwargs = self._active_transform
+            dataset = apply_transform(dataset, op, **kwargs)
+        return dataset
 
     def _on_tap(self, *event_stuff):
         x, y = self._tap_stream.x, self._tap_stream.y
         if x is None or y is None or np.isnan(x) or np.isnan(y):
             return
-        dataset = self._current_dataset()
+        dataset = self._viewed_dataset()
         if dataset is None:
             return
 
-        order = dataset.axis_plot_order if dataset.data.ndim >= 2 else [dataset.axes[0].name]
-        x_name = order[0]
-        y_name = order[1] if len(order) > 1 else None
+        sel = dataset.plot_selections
+        x_name = sel["x"]
+        y_name = sel.get("y")
 
         point = {
             "experiment": dataset.experiment,
@@ -172,9 +196,9 @@ class ScanBrowser(param.Parameterized):
             point["value"] = float(data_2d[yi, xi])
 
             # Record current slider positions for extra dimensions
-            for slider_name in order[2:]:
-                ax = next(a for a in dataset.axes if a.name == slider_name)
-                point[slider_name] = float(ax.values[len(ax.values) // 2])
+            for ax in dataset.axes:
+                if ax.name not in (x_name, y_name):
+                    point[ax.name] = float(ax.values[len(ax.values) // 2])
 
         self.picked_points = self.picked_points + [point]
         # Update points overlay via pipe (no full re-render)
@@ -197,15 +221,15 @@ class ScanBrowser(param.Parameterized):
         """Extract (plot_x, plot_y) tuples from pick dicts using axis names."""
         if not pts:
             return []
-        dataset = self._current_dataset()
+        dataset = self._viewed_dataset()
         if dataset is None:
             return []
         if dataset.data.ndim == 1:
             x_name = dataset.axes[0].name
-            return [(p[x_name], p["value"]) for p in pts]
-        order = dataset.axis_plot_order
-        x_name, y_name = order[0], order[1]
-        return [(p[x_name], p[y_name]) for p in pts]
+            return [(p.get(x_name), p.get("value")) for p in pts if x_name in p]
+        sel = dataset.plot_selections
+        return [(p[sel["x"]], p[sel["y"]]) for p in pts
+                if sel["x"] in p and sel["y"] in p]
 
     # --- Sidebar: interactive plot ---
 
@@ -213,14 +237,9 @@ class ScanBrowser(param.Parameterized):
     def sidebar_plot(self):
         if not self._sidebar_initialized:
             return pn.pane.Markdown("*Loading...*", width=680, height=200)
-        dataset = self._current_dataset()
+        dataset = self._viewed_dataset()
         if dataset is None:
             return pn.pane.Markdown("*No dataset selected*")
-
-        # Apply active transform if set
-        if self._active_transform is not None:
-            op, kwargs = self._active_transform
-            dataset = apply_transform(dataset, op, **kwargs)
 
         exp, rep = dataset.experiment, dataset.repeat
 
@@ -235,8 +254,9 @@ class ScanBrowser(param.Parameterized):
                 title=f"{exp}_{rep}",
             )
         elif dataset.data.ndim >= 2:
-            order = dataset.axis_plot_order
-            x_name, y_name = order[0], order[1]
+            order = dataset.plot_order
+            sel = dataset.plot_selections
+            x_name, y_name = sel["x"], sel["y"]
             slider_names = order[2:]
 
             img_opts = dict(
@@ -248,7 +268,7 @@ class ScanBrowser(param.Parameterized):
                 title=f"{exp}_{rep}",
             )
 
-            # Build hv.Dataset with all dimensions, reordered to match axis_plot_order
+            # Build hv.Dataset with all dimensions, reordered to match plot_order
             axis_names = [a.name for a in dataset.axes]
             perm = [axis_names.index(name) for name in reversed(order)]
             reordered = np.transpose(dataset.data, perm)
@@ -498,14 +518,67 @@ class ScanBrowser(param.Parameterized):
             pn.Row(preview_btn, apply_btn),
         )
 
+    # --- Sidebar: plot selections ---
+
+    @param.depends("selected_index", "_transform_changed")
+    def sidebar_plot_selections(self):
+        # Always use raw dataset — plot_selections controls raw axis mapping,
+        # transforms are just a preview overlay on top.
+        dataset = self._current_dataset()
+        if dataset is None or dataset.data.ndim < 2:
+            return pn.pane.Markdown("")
+
+        axis_names = [a.name for a in dataset.axes]
+        sel = dataset.plot_selections
+        x_val = sel["x"] if sel["x"] in axis_names else axis_names[0]
+        y_val = sel.get("y", axis_names[1] if len(axis_names) > 1 else axis_names[0])
+        if y_val not in axis_names:
+            y_val = axis_names[1] if len(axis_names) > 1 else axis_names[0]
+
+        x_select = pn.widgets.Select(
+            name="X axis", options=axis_names, value=x_val, width=150,
+        )
+        y_select = pn.widgets.Select(
+            name="Y axis", options=axis_names, value=y_val, width=150,
+        )
+
+        def on_change(event):
+            x, y = x_select.value, y_select.value
+            if x == y:
+                return
+            self._set_plot_selections({"x": x, "y": y})
+
+        x_select.param.watch(on_change, "value")
+        y_select.param.watch(on_change, "value")
+
+        apply_btn = pn.widgets.Button(name="Apply", button_type="success", width=120)
+
+        def on_apply(event):
+            x, y = x_select.value, y_select.value
+            if x == y:
+                return
+            self._set_plot_selections({"x": x, "y": y})
+            self._start_background_render(force=True)
+
+        apply_btn.on_click(on_apply)
+
+        return pn.Column(
+            pn.layout.Divider(),
+            pn.pane.Markdown("**Plot Selections**"),
+            pn.Row(x_select, y_select),
+            pn.Row(apply_btn),
+        )
+
     # --- Main: thumbnail grid ---
 
     _THUMB_H = 150
+    _cache_bust = 0  # incremented to force browser to reload thumbnails
 
     def _build_grid_html(self) -> str:
         """Generate raw HTML for the thumbnail grid. One string, zero Bokeh models."""
         thumb_dir = self._scan.dir / "thumbnails"
         img_w = int(self._THUMB_H * ASPECT_RATIO)
+        cb = self._cache_bust
 
         cells = []
         for i, (exp, rep) in enumerate(self._dataset_keys):
@@ -513,7 +586,7 @@ class ScanBrowser(param.Parameterized):
             png_path = thumb_dir / f"{key}.png"
             if png_path.exists():
                 img_tag = (
-                    f'<img src="/thumbnails/{self.serial}/thumbnails/{key}.png"'
+                    f'<img src="/thumbnails/{self.serial}/thumbnails/{key}.png?v={cb}"'
                     f' width="{img_w}" height="{self._THUMB_H}"'
                     f' style="display:block;" />'
                 )
@@ -539,21 +612,33 @@ class ScanBrowser(param.Parameterized):
             f'</div>'
         )
 
-    def _start_background_render(self):
+    def _start_background_render(self, force: bool = False):
         """Render thumbnails in a subprocess, then update grid HTML at once."""
         thumb_dir = self._scan.dir / "thumbnails"
 
-        needs_render = any(
-            not (thumb_dir / f"{exp}_{rep}.png").exists()
-            for exp, rep in self._dataset_keys
-        )
-        if not needs_render:
-            return
+        if force:
+            self._cache_bust += 1
 
-        proc = subprocess.Popen(
-            [sys.executable, "-c",
-             f"from explore.dataset import Scan; Scan.load('{self.serial}').render()"],
+        if not force:
+            needs_render = any(
+                not (thumb_dir / f"{exp}_{rep}.png").exists()
+                for exp, rep in self._dataset_keys
+            )
+            if not needs_render:
+                return
+
+        # Build subprocess script, optionally setting plot_selections
+        ds = self._scan.datasets[0] if self._scan.datasets else None
+        sel = ds._plot_selections if ds else None
+        sel_str = repr(sel)
+        script = (
+            "from explore.dataset import Scan; "
+            + f"s = Scan.load('{self.serial}'); "
+            + ("" if not sel else f"[setattr(d, 'plot_selections', {sel_str}) for d in s.datasets]; ")
+            + "s.render()"
         )
+
+        proc = subprocess.Popen([sys.executable, "-c", script])
 
         def wait_and_rebuild():
             proc.wait()
@@ -595,6 +680,16 @@ def app():
 
     browser = ScanBrowser(serial=serial)
 
+    # Apply plot selections from query params if provided (e.g. ?x=voltage&y=current)
+    sel_from_url = {}
+    if pn.state.session_args.get("x"):
+        sel_from_url["x"] = pn.state.session_args["x"][0].decode("utf-8")
+    if pn.state.session_args.get("y"):
+        sel_from_url["y"] = pn.state.session_args["y"][0].decode("utf-8")
+    has_custom_sel = bool(sel_from_url)
+    if has_custom_sel:
+        browser._set_plot_selections(sel_from_url)
+
     # Grid: plain HTML pane (handles any size, no Bokeh model overhead)
     grid_pane = pn.pane.HTML(
         browser._build_grid_html() if browser._scan else "",
@@ -609,8 +704,9 @@ def app():
     )
 
     # Kick off background rendering now that grid pane is wired up
+    # force=True when custom selections requested (re-render with new axes)
     if browser._scan:
-        browser._start_background_render()
+        browser._start_background_render(force=has_custom_sel)
 
     # Defer sidebar: render placeholder initially, full HoloViews after page loads
     def _init_sidebar():
@@ -619,10 +715,21 @@ def app():
 
     pn.state.onload(_init_sidebar)
 
+    # Clean up _browsers registry when tab is closed
+    def _cleanup(session_context):
+        _browsers.pop(serial, None)
+
+    pn.state.on_session_destroyed(_cleanup)
+
     template = pn.template.FastListTemplate(
         title=f"Scan: {serial}" if serial else "Explore",
         sidebar_width=750,
-        sidebar=[browser.sidebar_plot, browser.sidebar_controls, browser.sidebar_transforms],
+        sidebar=[
+            browser.sidebar_plot,
+            browser.sidebar_plot_selections,
+            browser.sidebar_controls,
+            browser.sidebar_transforms,
+        ],
         main=[nav, grid_pane],
         theme="dark",
     )
